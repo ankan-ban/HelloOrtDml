@@ -143,10 +143,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="lodepng\lodepng.cpp" />
     <ClCompile Include="Source.cpp" />
+    <ClCompile Include="utils.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Common.h" />
     <ClInclude Include="d3dx12.h" />
+    <ClInclude Include="lodepng\lodepng.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

@@ -1,49 +1,19 @@
 // Minimal C++ example for using Onnxruntime APIs with DML ep
 // 
 // Goals:
-//   - Avoid CPU <-> GPU transfers at each inference (TODO: also demonstrate how to use d3d12 copy queue to pipeline the copies)
-//   - pipeline multiple inference requests to keep GPU occupied all the time.
+//   - Avoid CPU <-> GPU transfers at each inference 
+//       (TODO: also demonstrate how to use d3d12 copy queue to pipeline the copies if they are needed)
+//   - Pipeline multiple inference requests to keep GPU occupied all the time.
 
 const int warmupIterations = 100;
 const int iterations = 100;
 
 #include <stdio.h>
 
-#include "d3dx12.h"
-
+#include "Common.h"
 #include "dml_provider_factory.h"
 #include "onnxruntime_cxx_api.h"
 #include <chrono>
-
-void CreateD3D12Buffer(ID3D12Device* pDevice, const size_t size, ID3D12Resource** ppResource)
-{
-    D3D12_RESOURCE_DESC bufferDesc = {};
-    bufferDesc.MipLevels = 1;
-    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-    bufferDesc.Width = size;
-    bufferDesc.Height = 1;
-    bufferDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    bufferDesc.DepthOrArraySize = 1;
-    bufferDesc.SampleDesc.Count = 1;
-    bufferDesc.SampleDesc.Quality = 0;
-    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    HRESULT hr = pDevice->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-        D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(ppResource));
-
-    if (FAILED(hr))
-    {
-        printf("\nFailed creating a resource\n");
-        exit(0);
-    }
-}
-
 
 int main()
 {
@@ -66,6 +36,7 @@ int main()
     // Create d3d12 resources (to be used for input and output of the network)
     CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &pInput);
     CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &pOutput);
+    uploadInputImageToD3DResource(pDevice, pCommandQueue, pInput, "input.png");
 
     // Event and D3D12 Fence to manage CPU<->GPU sync (we want to keep 2 iterations in "flight")
     HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -119,29 +90,13 @@ int main()
     // Create ORT tensors from D3D12 resources that we created, and bind them.
     void* dml_resource_input;
     ortDmlApi->CreateGPUAllocationFromD3DResource(pInput, &dml_resource_input);
-    Ort::Value inputTensor(
-        Ort::Value::CreateTensor(
-            memoryInformation,
-            dml_resource_input,
-            pInput->GetDesc().Width,
-            inputDim,
-            4,
-            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        )
-    );
+    Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, dml_resource_input, pInput->GetDesc().Width,
+            inputDim, 4,ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
 
     void* dml_resource_output;
     ortDmlApi->CreateGPUAllocationFromD3DResource(pOutput, &dml_resource_output);
-    Ort::Value outputTensor(
-        Ort::Value::CreateTensor(
-            memoryInformation,
-            dml_resource_output,
-            pOutput->GetDesc().Width,
-            outputDim,
-            4,
-            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        )
-    );
+    Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, dml_resource_output, pOutput->GetDesc().Width,
+            outputDim, 4,ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
 
     ioBinding.BindInput(InputTensorName.get(), inputTensor);
     ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
@@ -182,6 +137,9 @@ int main()
     auto end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(end - start).count();
 
+    // save the output to disk
+    saveOutputImageFromD3DResource(pDevice, pCommandQueue, pOutput, "output.png");
+
     ortDmlApi->FreeGPUAllocation(dml_resource_input);
     ortDmlApi->FreeGPUAllocation(dml_resource_output);
     pDmlDevice->Release();
@@ -191,6 +149,7 @@ int main()
     pCommandQueue->Release();
     pDevice->Release();
     session.release();
+    CloseHandle(hEvent);
     printf("\nInference loop done. %d iterations in %g ms - avg: %g ms per iteration\n", iterations, duration, duration/iterations);
     return 0;
 }
