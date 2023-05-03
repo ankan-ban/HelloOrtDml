@@ -72,17 +72,10 @@ int main()
     Ort::MemoryInfo memoryInformation("DML", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemType::OrtMemTypeDefault);
     Ort::Allocator deviceAllocator(session, memoryInformation);
 
-    printf("Found %d inputs and %d outputs in the model", (int)session.GetInputCount(), (int)session.GetOutputCount());
-
     // we know there is only single input and single output for this model
     Ort::AllocatorWithDefaultOptions allocator;
     Ort::AllocatedStringPtr InputTensorName = session.GetInputNameAllocated(0, allocator);
     Ort::AllocatedStringPtr OuptutTensorName = session.GetOutputNameAllocated(0, allocator);
-
-    printf("\nInput Tensor Name: %s, output tensor name: %s\n", InputTensorName.get(), OuptutTensorName.get());
-
-    Ort::TypeInfo InputTypeInfo = session.GetInputTypeInfo(0);
-    Ort::TypeInfo OutputTypeInfo = session.GetOutputTypeInfo(0);
 
     int64_t inputDim[] = { 1, 3, 720, 720 };
     int64_t outputDim[] = { 1, 3, 720, 720 };
