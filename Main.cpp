@@ -2,8 +2,11 @@
 // 
 // Goals:
 //   - Avoid CPU <-> GPU transfers at each inference 
-//       (TODO: also demonstrate how to use d3d12 copy queue to pipeline the copies if they are needed)
+//     * or if really needed, demonstrate how to use asynchronous d3d12 copy queues to handle the transfers
 //   - Pipeline multiple inference requests to keep GPU occupied all the time.
+
+const bool perIterationTransfers = true;
+constexpr int iterationInFlight = 3;
 
 const int warmupIterations = 100;
 const int iterations = 100;
@@ -15,14 +18,39 @@ const int iterations = 100;
 #include "onnxruntime_cxx_api.h"
 #include <chrono>
 
+struct GpuResourceData
+{
+    ID3D12Resource* pInput;
+    ID3D12Resource* pOutput;
+
+    ID3D12Resource* pUploadRes;
+    ID3D12Resource* pDownloadRes;
+
+    // command lists to upload/download the inputs/outputs
+    ID3D12GraphicsCommandList* pUploadCommandList;
+    ID3D12GraphicsCommandList* pDownloadCommandList;
+
+    void* dml_resource_input;
+    void* dml_resource_output;
+};
+
+float cpuInput[3 * 720 * 720];
+float cpuOutput[3 * 720 * 720];
+
 int main()
 {
     HRESULT hr = S_OK;
 
     ID3D12Device* pDevice;
     ID3D12CommandQueue* pCommandQueue;
-    ID3D12Resource* pInput;
-    ID3D12Resource* pOutput;
+    ID3D12CommandQueue* pUploadQueue;
+    ID3D12CommandQueue* pDownloadQueue;
+    ID3D12CommandAllocator* pAllocator;
+
+    GpuResourceData resources[iterationInFlight];
+
+    // load the input image from file into CPU memory
+    loadInputImage(cpuInput, "input.png");
 
     // Create Device
     hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pDevice));
@@ -33,15 +61,52 @@ int main()
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pCommandQueue));
 
+    // command allocator to record upload / download commands
+    hr = pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&pAllocator));
+
+    // create the additional command queues to manage async uploads and downloads
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pUploadQueue));
+    hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pDownloadQueue));
+
+    int numCopiesToCreate = 1;
+    if (perIterationTransfers)
+    {
+        numCopiesToCreate = iterationInFlight;
+    }
+
     // Create d3d12 resources (to be used for input and output of the network)
-    CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &pInput);
-    CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &pOutput);
-    uploadInputImageToD3DResource(pDevice, pCommandQueue, pInput, "input.png");
+    for (int i = 0; i < numCopiesToCreate; i++)
+    {
+        // default resources
+        CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &resources[i].pInput, D3D12_RESOURCE_STATE_COPY_DEST);
+        CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &resources[i].pOutput, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        // upload and download resources
+        CreateUploadBuffer(pDevice, 3 * 720 * 720 * sizeof(float), &resources[i].pUploadRes);
+        CreateReadBackBuffer(pDevice, 3 * 720 * 720 * sizeof(float), &resources[i].pDownloadRes);
+
+        // command lists to handle uploads/downloads
+
+        // record the commands in the upload command list
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocator, NULL, __uuidof(ID3D12GraphicsCommandList), (void**)&resources[i].pUploadCommandList);
+        resources[i].pUploadCommandList->CopyResource(resources[i].pInput, resources[i].pUploadRes);
+        resources[i].pUploadCommandList->Close();
+
+        // record the commands in the download command list
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocator, NULL, __uuidof(ID3D12GraphicsCommandList), (void**)&resources[i].pDownloadCommandList);
+        resources[i].pDownloadCommandList->CopyResource(resources[i].pDownloadRes, resources[i].pOutput);
+        resources[i].pDownloadCommandList->Close();
+    }
 
     // Event and D3D12 Fence to manage CPU<->GPU sync (we want to keep 2 iterations in "flight")
     HANDLE hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    ID3D12Fence* pFence = nullptr;
-    pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFence));
+    ID3D12Fence* pFenceUpload = nullptr;
+    ID3D12Fence* pFenceInference = nullptr;
+    ID3D12Fence* pFenceDownload = nullptr;
+    pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFenceUpload));
+    pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFenceInference));
+    pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFenceDownload));
 
     // DML device to use for ORT APIs
     IDMLDevice* pDmlDevice = nullptr;
@@ -80,66 +145,160 @@ int main()
     int64_t inputDim[] = { 1, 3, 720, 720 };
     int64_t outputDim[] = { 1, 3, 720, 720 };
 
-    // Create ORT tensors from D3D12 resources that we created, and bind them.
-    void* dml_resource_input;
-    ortDmlApi->CreateGPUAllocationFromD3DResource(pInput, &dml_resource_input);
-    Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, dml_resource_input, pInput->GetDesc().Width,
-            inputDim, 4,ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+    // Create ORT tensors from D3D12 resources that we created
+    for (int i = 0; i < numCopiesToCreate; i++)
+    {
+        ortDmlApi->CreateGPUAllocationFromD3DResource(resources[i].pInput, &resources[i].dml_resource_input);
+        ortDmlApi->CreateGPUAllocationFromD3DResource(resources[i].pOutput, &resources[i].dml_resource_output);
+    }
 
-    void* dml_resource_output;
-    ortDmlApi->CreateGPUAllocationFromD3DResource(pOutput, &dml_resource_output);
-    Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, dml_resource_output, pOutput->GetDesc().Width,
-            outputDim, 4,ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+    if (!perIterationTransfers)
+    {
+        // upload the input and wait for the upload to finish
+        float* pData;
+        resources[0].pUploadRes->Map(0, nullptr, (void**)&pData);
+        memcpy(pData, cpuInput, sizeof(cpuInput));
+        resources[0].pUploadRes->Unmap(0, nullptr);
 
-    ioBinding.BindInput(InputTensorName.get(), inputTensor);
-    ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
-    ioBinding.SynchronizeInputs();
+        pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[0].pUploadCommandList);
+        FlushAndWait(pDevice, pUploadQueue);
 
+        // bind the resources
+        Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[0].dml_resource_input, resources[0].pInput->GetDesc().Width,
+            inputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+        Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[0].dml_resource_output, resources[0].pOutput->GetDesc().Width,
+            outputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+
+        ioBinding.BindInput(InputTensorName.get(), inputTensor);
+        ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
+        ioBinding.SynchronizeInputs();
+    }
     // Benchmark the model (schedule 100 iterations on the command queue for testing)
     Ort::RunOptions runOptions;
 
-    // Warmup
-    for (int i = 1; i <= warmupIterations; i++)
-    {
-        session.Run(runOptions, ioBinding);
-        pCommandQueue->Signal(pFence, i);
-        pFence->SetEventOnCompletion(i, hEvent);    // immediately wait for the GPU results
-        DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
-    }
-
-    // Actual run for benchmarking
-
+    // benchmarking run with few warm-up iterations
     auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iterations; i++)
+    int totalIterations = warmupIterations + iterations;
+    for (int i = 0; i < totalIterations; i++)
     {
+        int fenceVal = i + 1;
+
+        if (i == warmupIterations)
+            start = std::chrono::high_resolution_clock::now();
+
+        int resourceIndex = fenceVal % numCopiesToCreate;
+
+        if (perIterationTransfers)
+        {
+            // copy input from CPU->GPU
+            float* pData;
+            resources[resourceIndex].pUploadRes->Map(0, nullptr, (void**)&pData);
+            memcpy(pData, cpuInput, sizeof(cpuInput));
+            resources[resourceIndex].pUploadRes->Unmap(0, nullptr);
+
+            pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pUploadCommandList);
+            //FlushAndWait(pDevice, pUploadQueue);   // For debug
+            pUploadQueue->Signal(pFenceUpload, fenceVal);
+
+            // Bind the inputs and outputs
+            Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_input, resources[resourceIndex].pInput->GetDesc().Width,
+                inputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+            Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_output, resources[resourceIndex].pOutput->GetDesc().Width,
+                outputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+
+            ioBinding.BindInput(InputTensorName.get(), inputTensor);
+            ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
+
+            // make the inference wait for the upload
+            pCommandQueue->Wait(pFenceUpload, fenceVal);
+        }
+
         session.Run(runOptions, ioBinding);
-        pCommandQueue->Signal(pFence, i + 1);
+        pCommandQueue->Signal(pFenceInference, fenceVal);
+
+        if (perIterationTransfers)
+        {
+            // Make the download wait for the inference
+            pDownloadQueue->Wait(pFenceInference, fenceVal);
+
+            // copy output from GPU->CPU
+            pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pDownloadCommandList);
+            // FlushAndWait(pDevice, pDownloadQueue);   // debug
+            pDownloadQueue->Signal(pFenceDownload, fenceVal);
+
+        }
+
 
         // wait for (i-2)nd iteration (so that we have 2 iterations in flight)
-        if (i > 1)
+        int oldIter = fenceVal - (iterationInFlight - 1);
+
+        if (oldIter > 0)
         {
-            pFence->SetEventOnCompletion(i - 1, hEvent);
-            DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+            if (perIterationTransfers)
+            {
+                pFenceDownload->SetEventOnCompletion(oldIter, hEvent);
+                DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+
+                resourceIndex = oldIter % numCopiesToCreate;
+
+                // read back data
+                float* pData;
+                resources[resourceIndex].pDownloadRes->Map(0, nullptr, (void**)&pData);
+                memcpy(cpuOutput, pData, sizeof(cpuInput));
+                resources[resourceIndex].pDownloadRes->Unmap(0, nullptr);
+            }
+            else
+            {
+                pFenceInference->SetEventOnCompletion(oldIter, hEvent);
+                DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+            }
         }
     }
 
     // Wait for the last iteration
-    pFence->SetEventOnCompletion(iterations, hEvent);
+    pFenceInference->SetEventOnCompletion(totalIterations, hEvent);
     DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
 
     auto end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(end - start).count();
 
-    // save the output to disk
-    saveOutputImageFromD3DResource(pDevice, pCommandQueue, pOutput, "output.png");
+    if (!perIterationTransfers)
+    {
+        // download the output to cpu memory
+        pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[0].pDownloadCommandList);
+        FlushAndWait(pDevice, pDownloadQueue);
 
-    ortDmlApi->FreeGPUAllocation(dml_resource_input);
-    ortDmlApi->FreeGPUAllocation(dml_resource_output);
+        float* pData;
+        resources[0].pDownloadRes->Map(0, nullptr, (void**)&pData);
+        memcpy(cpuOutput, pData, sizeof(cpuInput));
+        resources[0].pDownloadRes->Unmap(0, nullptr);
+    }
+
+    // save the output to disk
+    saveOutputImage(cpuOutput, "output.png");
+
+    for (int i = 0; i < numCopiesToCreate; i++)
+    {
+        ortDmlApi->FreeGPUAllocation(resources[i].dml_resource_input);
+        ortDmlApi->FreeGPUAllocation(resources[i].dml_resource_output);
+
+        resources[i].pInput->Release();
+        resources[i].pOutput->Release();
+
+        resources[i].pDownloadCommandList->Release();
+        resources[i].pUploadCommandList->Release();
+        resources[i].pUploadRes->Release();
+        resources[i].pDownloadRes->Release();
+    }
+
     pDmlDevice->Release();
-    pFence->Release();
-    pInput->Release();
-    pOutput->Release();
+    pFenceUpload->Release();
+    pFenceInference->Release();
+    pFenceDownload->Release();
     pCommandQueue->Release();
+    pUploadQueue->Release();
+    pDownloadQueue->Release();
+    pAllocator->Release();
     pDevice->Release();
     session.release();
     CloseHandle(hEvent);
