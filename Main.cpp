@@ -1,14 +1,17 @@
 // Minimal C++ example for using Onnxruntime APIs with DML ep
 // 
 // Goals:
-//   - Avoid CPU <-> GPU transfers at each inference 
-//     * or if really needed, demonstrate how to use asynchronous d3d12 copy queues to handle the transfers
-//   - Pipeline multiple inference requests to keep GPU occupied all the time.
+//   - Avoid serial CPU <-> GPU transfers at each inference.
+//     * If really needed, demonstrate how to use asynchronous d3d12 copy queues to handle the transfers
+//   - Pipeline multiple inference requests to keep GPU occupied all the time (i.e, don't wait immediately for inference result).
+// 
 
-const bool perIterationTransfers = true;
-constexpr int iterationInFlight = 3;
+const bool useCpuBindings = false;          // bind resources on CPU memory
+const bool perIterationTransfers = true;    // Set to true to perform CPU<->GPU transfers in each iteration (pipelined with inference work)
+constexpr int iterationInFlight = 3;        // no of "iterations in flight" for the pipeline. 1 means no parallelism.
 constexpr bool useFp16Model = true;
 
+// for benchmarking
 const int warmupIterations = 1000;
 const int iterations = 1000;
 
@@ -159,7 +162,51 @@ int main()
         ortDmlApi->CreateGPUAllocationFromD3DResource(resources[i].pOutput, &resources[i].dml_resource_output);
     }
 
-    if (!perIterationTransfers)
+
+    // CPU based binding path
+    OrtValue* cpu_ort_tensor_input = NULL;
+    OrtValue* cpu_ort_tensor_output = NULL;
+
+    if (useCpuBindings)
+    {
+        /*
+        OrtMemoryInfo* cpu_memory_info;
+        ortApi.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_memory_info);
+        if (useFp16Model)
+        {
+            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuInputFloat, sizeof(cpuInputFloat), inputDim,
+                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &cpu_ort_tensor_input);
+            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuOutputFloat, sizeof(cpuOutputFloat), inputDim,
+                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &cpu_ort_tensor_output);
+        }
+        else
+        {
+            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuInputHalf, sizeof(cpuInputHalf), inputDim,
+                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, &cpu_ort_tensor_input);
+            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuOutputHalf, sizeof(cpuOutputHalf), inputDim,
+                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, &cpu_ort_tensor_output);
+        }
+        */
+        OrtMemoryInfo* cpu_memory_info;
+        ortApi.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_memory_info);
+
+        Ort::Value inputTensor(Ort::Value::CreateTensor(cpu_memory_info, 
+            useFp16Model ? (void*) cpuInputHalf : (void *)cpuInputFloat, 
+            useFp16Model ? sizeof(cpuInputHalf) : sizeof(cpuInputFloat),
+            inputDim, 4, 
+            useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+
+        Ort::Value outputTensor(Ort::Value::CreateTensor(cpu_memory_info, 
+            useFp16Model ? (void*)cpuOutputHalf : (void*)cpuOutputFloat,
+            useFp16Model ? sizeof(cpuOutputHalf) : sizeof(cpuOutputFloat),
+            outputDim, 4, 
+            useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+
+        ioBinding.BindInput(InputTensorName.get(), inputTensor);
+        ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
+        ioBinding.SynchronizeInputs();
+    }
+    else if (!perIterationTransfers)
     {
         // upload the input and wait for the upload to finish
         void* pData;
@@ -196,89 +243,99 @@ int main()
         if (i == warmupIterations)
             start = std::chrono::high_resolution_clock::now();
 
-        int resourceIndex = fenceVal % numCopiesToCreate;
-
-        if (perIterationTransfers)
+        if (useCpuBindings)
         {
-            // copy input from CPU->GPU
-            void* pData;
-            resources[resourceIndex].pUploadRes->Map(0, nullptr, (void**)&pData);
-            if (useFp16Model)
-                memcpy(pData, cpuInputHalf, sizeof(cpuInputHalf));
-            else
-                memcpy(pData, cpuInputFloat, sizeof(cpuInputFloat));
-            resources[resourceIndex].pUploadRes->Unmap(0, nullptr);
-
-            pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pUploadCommandList);
-            //FlushAndWait(pDevice, pUploadQueue);   // For debug
-            pUploadQueue->Signal(pFenceUpload, fenceVal);
-
-            // Bind the inputs and outputs
-            Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_input, resources[resourceIndex].pInput->GetDesc().Width,
-                inputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
-            Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_output, resources[resourceIndex].pOutput->GetDesc().Width,
-                outputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
-
-            ioBinding.BindInput(InputTensorName.get(), inputTensor);
-            ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
-
-            // make the inference wait for the upload
-            pCommandQueue->Wait(pFenceUpload, fenceVal);
+            session.Run(runOptions, ioBinding);
         }
-
-        session.Run(runOptions, ioBinding);
-        pCommandQueue->Signal(pFenceInference, fenceVal);
-
-        if (perIterationTransfers)
+        else
         {
-            // Make the download wait for the inference
-            pDownloadQueue->Wait(pFenceInference, fenceVal);
+            int resourceIndex = fenceVal % numCopiesToCreate;
 
-            // copy output from GPU->CPU
-            pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pDownloadCommandList);
-            // FlushAndWait(pDevice, pDownloadQueue);   // debug
-            pDownloadQueue->Signal(pFenceDownload, fenceVal);
-
-        }
-
-
-        // wait for (i-2)nd iteration (so that we have 2 iterations in flight)
-        int oldIter = fenceVal - (iterationInFlight - 1);
-
-        if (oldIter > 0)
-        {
             if (perIterationTransfers)
             {
-                pFenceDownload->SetEventOnCompletion(oldIter, hEvent);
-                DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
-
-                resourceIndex = oldIter % numCopiesToCreate;
-
-                // read back data
+                // copy input from CPU->GPU
                 void* pData;
-                resources[resourceIndex].pDownloadRes->Map(0, nullptr, (void**)&pData);
+                resources[resourceIndex].pUploadRes->Map(0, nullptr, (void**)&pData);
                 if (useFp16Model)
-                    memcpy(cpuOutputHalf, pData, sizeof(cpuOutputHalf));
+                    memcpy(pData, cpuInputHalf, sizeof(cpuInputHalf));
                 else
-                    memcpy(cpuOutputFloat, pData, sizeof(cpuOutputFloat));
-                resources[resourceIndex].pDownloadRes->Unmap(0, nullptr);
+                    memcpy(pData, cpuInputFloat, sizeof(cpuInputFloat));
+                resources[resourceIndex].pUploadRes->Unmap(0, nullptr);
+
+                pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pUploadCommandList);
+                //FlushAndWait(pDevice, pUploadQueue);   // For debug
+                pUploadQueue->Signal(pFenceUpload, fenceVal);
+
+                // Bind the inputs and outputs
+                Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_input, resources[resourceIndex].pInput->GetDesc().Width,
+                    inputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+                Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_output, resources[resourceIndex].pOutput->GetDesc().Width,
+                    outputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+
+                ioBinding.BindInput(InputTensorName.get(), inputTensor);
+                ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
+
+                // make the inference wait for the upload
+                pCommandQueue->Wait(pFenceUpload, fenceVal);
             }
-            else
+
+            session.Run(runOptions, ioBinding);
+            pCommandQueue->Signal(pFenceInference, fenceVal);
+
+            if (perIterationTransfers)
             {
-                pFenceInference->SetEventOnCompletion(oldIter, hEvent);
-                DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+                // Make the download wait for the inference
+                pDownloadQueue->Wait(pFenceInference, fenceVal);
+
+                // copy output from GPU->CPU
+                pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pDownloadCommandList);
+                // FlushAndWait(pDevice, pDownloadQueue);   // debug
+                pDownloadQueue->Signal(pFenceDownload, fenceVal);
+
+            }
+
+
+            // wait for (i-2)nd iteration (so that we have 2 iterations in flight)
+            int oldIter = fenceVal - (iterationInFlight - 1);
+
+            if (oldIter > 0)
+            {
+                if (perIterationTransfers)
+                {
+                    pFenceDownload->SetEventOnCompletion(oldIter, hEvent);
+                    DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+
+                    resourceIndex = oldIter % numCopiesToCreate;
+
+                    // read back data
+                    void* pData;
+                    resources[resourceIndex].pDownloadRes->Map(0, nullptr, (void**)&pData);
+                    if (useFp16Model)
+                        memcpy(cpuOutputHalf, pData, sizeof(cpuOutputHalf));
+                    else
+                        memcpy(cpuOutputFloat, pData, sizeof(cpuOutputFloat));
+                    resources[resourceIndex].pDownloadRes->Unmap(0, nullptr);
+                }
+                else
+                {
+                    pFenceInference->SetEventOnCompletion(oldIter, hEvent);
+                    DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+                }
             }
         }
     }
 
     // Wait for the last iteration
-    pFenceInference->SetEventOnCompletion(totalIterations, hEvent);
-    DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+    if (!useCpuBindings)
+    {
+        pFenceInference->SetEventOnCompletion(totalIterations, hEvent);
+        DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+    }
 
     auto end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(end - start).count();
 
-    if (!perIterationTransfers)
+    if (!useCpuBindings && !perIterationTransfers)
     {
         // download the output to cpu memory
         pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[0].pDownloadCommandList);
@@ -312,6 +369,11 @@ int main()
         resources[i].pUploadRes->Release();
         resources[i].pDownloadRes->Release();
     }
+
+    if (cpu_ort_tensor_input)
+        ortApi.ReleaseValue(cpu_ort_tensor_input);
+    if (cpu_ort_tensor_output)
+        ortApi.ReleaseValue(cpu_ort_tensor_output);
 
     pDmlDevice->Release();
     pFenceUpload->Release();
