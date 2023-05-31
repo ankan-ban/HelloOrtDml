@@ -1,5 +1,8 @@
+#include "half.hpp"
 #include "Common.h"
 #include "lodepng/lodepng.h"
+
+using half_float::half;
 
 void CreateD3D12Buffer(ID3D12Device* pDevice, const size_t size, ID3D12Resource** ppResource, D3D12_RESOURCE_STATES initState)
 {
@@ -69,8 +72,11 @@ void FlushAndWait(ID3D12Device* pDevice, ID3D12CommandQueue* pQueue)
 }
 
 
-void loadInputImage(float *pData, char* imageFileName)
+void loadInputImage(void *pData, char* imageFileName, bool fp16)
 {
+    half* hData = (half*)pData;
+    float *fData = (float*)pData;
+
     unsigned char* image;
     unsigned int width, height;
     unsigned int error = lodepng_decode32_file(&image, &width, &height, imageFileName);
@@ -91,9 +97,18 @@ void loadInputImage(float *pData, char* imageFileName)
             unsigned char g = image[(y * width + x) * 4 + 1];
             unsigned char b = image[(y * width + x) * 4 + 2];
 
-            pData[0 * width * height + y * width + x] = (float)b;
-            pData[1 * width * height + y * width + x] = (float)g;
-            pData[2 * width * height + y * width + x] = (float)r;
+            if (fp16)
+            {
+                hData[0 * width * height + y * width + x] = (half)b;
+                hData[1 * width * height + y * width + x] = (half)g;
+                hData[2 * width * height + y * width + x] = (half)r;
+            }
+            else
+            {
+                fData[0 * width * height + y * width + x] = (float)b;
+                fData[1 * width * height + y * width + x] = (float)g;
+                fData[2 * width * height + y * width + x] = (float)r;
+            }
         }
 
     free(image);
@@ -106,17 +121,30 @@ unsigned char clampAndConvert(float val)
     return (unsigned char)val;
 }
 
-void saveOutputImage(float *pData, char* imageFileName)
+void saveOutputImage(void *pData, char* imageFileName, bool fp16)
 {
+    half* hData = (half*)pData;
+    float* fData = (float*)pData;
+
     unsigned int width = 720, height = 720; // hardcoded in the model
 
     std::vector<unsigned char> image(width * height * 4);
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
         {
-            float b = pData[0 * width * height + y * width + x];
-            float g = pData[1 * width * height + y * width + x];
-            float r = pData[2 * width * height + y * width + x];
+            float b, g, r;
+            if (fp16)
+            {
+                b = (float)hData[0 * width * height + y * width + x];
+                g = (float)hData[1 * width * height + y * width + x];
+                r = (float)hData[2 * width * height + y * width + x];
+            }
+            else
+            {
+                b = fData[0 * width * height + y * width + x];
+                g = fData[1 * width * height + y * width + x];
+                r = fData[2 * width * height + y * width + x];
+            }
 
             image[(y * width + x) * 4 + 0] = clampAndConvert(r);
             image[(y * width + x) * 4 + 1] = clampAndConvert(g);

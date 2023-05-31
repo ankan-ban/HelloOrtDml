@@ -5,7 +5,7 @@ void CreateD3D12Buffer(ID3D12Device* pDevice, const size_t size, ID3D12Resource*
 void CreateUploadBuffer(ID3D12Device* pDevice, const size_t size, ID3D12Resource** ppResource);
 void CreateReadBackBuffer(ID3D12Device* pDevice, const size_t size, ID3D12Resource** ppResource);
 
-void loadInputImage(float* pData, char* imageFileName);
-void saveOutputImage(float* pData, char* imageFileName);
+void loadInputImage(void* pData, char* imageFileName, bool fp16);
+void saveOutputImage(void* pData, char* imageFileName, bool fp16);
 
 void FlushAndWait(ID3D12Device* pDevice, ID3D12CommandQueue* pQueue);

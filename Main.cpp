@@ -7,9 +7,10 @@
 
 const bool perIterationTransfers = true;
 constexpr int iterationInFlight = 3;
+constexpr bool useFp16Model = true;
 
-const int warmupIterations = 100;
-const int iterations = 100;
+const int warmupIterations = 1000;
+const int iterations = 1000;
 
 #include <stdio.h>
 
@@ -34,8 +35,11 @@ struct GpuResourceData
     void* dml_resource_output;
 };
 
-float cpuInput[3 * 720 * 720];
-float cpuOutput[3 * 720 * 720];
+float cpuInputFloat[3 * 720 * 720];
+float cpuOutputFloat[3 * 720 * 720];
+
+uint16_t cpuInputHalf[3 * 720 * 720];
+uint16_t cpuOutputHalf[3 * 720 * 720];
 
 int main()
 {
@@ -50,7 +54,10 @@ int main()
     GpuResourceData resources[iterationInFlight];
 
     // load the input image from file into CPU memory
-    loadInputImage(cpuInput, "input.png");
+    if (useFp16Model)
+        loadInputImage(cpuInputHalf, "input.png", true);
+    else
+        loadInputImage(cpuInputFloat, "input.png", false);
 
     // Create Device
     hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pDevice));
@@ -131,7 +138,7 @@ int main()
     // Make ORT use DML EP
     ortDmlApi->SessionOptionsAppendExecutionProvider_DML1(sessionOptions, pDmlDevice, pCommandQueue);
 
-    Ort::Session session = Ort::Session(ortEnvironment, L"fns-candy.onnx", sessionOptions);
+    Ort::Session session = Ort::Session(ortEnvironment, useFp16Model ? L"fns-candy-fp16.onnx" : L"fns-candy.onnx", sessionOptions);
 
     Ort::IoBinding ioBinding = Ort::IoBinding::IoBinding(session);
     Ort::MemoryInfo memoryInformation("DML", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemType::OrtMemTypeDefault);
@@ -155,9 +162,12 @@ int main()
     if (!perIterationTransfers)
     {
         // upload the input and wait for the upload to finish
-        float* pData;
+        void* pData;
         resources[0].pUploadRes->Map(0, nullptr, (void**)&pData);
-        memcpy(pData, cpuInput, sizeof(cpuInput));
+        if (useFp16Model)
+            memcpy(pData, cpuInputHalf, sizeof(cpuInputHalf));
+        else
+            memcpy(pData, cpuInputFloat, sizeof(cpuInputFloat));
         resources[0].pUploadRes->Unmap(0, nullptr);
 
         pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[0].pUploadCommandList);
@@ -165,9 +175,9 @@ int main()
 
         // bind the resources
         Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[0].dml_resource_input, resources[0].pInput->GetDesc().Width,
-            inputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+            inputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
         Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[0].dml_resource_output, resources[0].pOutput->GetDesc().Width,
-            outputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+            outputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
 
         ioBinding.BindInput(InputTensorName.get(), inputTensor);
         ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
@@ -191,9 +201,12 @@ int main()
         if (perIterationTransfers)
         {
             // copy input from CPU->GPU
-            float* pData;
+            void* pData;
             resources[resourceIndex].pUploadRes->Map(0, nullptr, (void**)&pData);
-            memcpy(pData, cpuInput, sizeof(cpuInput));
+            if (useFp16Model)
+                memcpy(pData, cpuInputHalf, sizeof(cpuInputHalf));
+            else
+                memcpy(pData, cpuInputFloat, sizeof(cpuInputFloat));
             resources[resourceIndex].pUploadRes->Unmap(0, nullptr);
 
             pUploadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pUploadCommandList);
@@ -202,9 +215,9 @@ int main()
 
             // Bind the inputs and outputs
             Ort::Value inputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_input, resources[resourceIndex].pInput->GetDesc().Width,
-                inputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+                inputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
             Ort::Value outputTensor(Ort::Value::CreateTensor(memoryInformation, resources[resourceIndex].dml_resource_output, resources[resourceIndex].pOutput->GetDesc().Width,
-                outputDim, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+                outputDim, 4, useFp16Model ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
 
             ioBinding.BindInput(InputTensorName.get(), inputTensor);
             ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
@@ -242,9 +255,12 @@ int main()
                 resourceIndex = oldIter % numCopiesToCreate;
 
                 // read back data
-                float* pData;
+                void* pData;
                 resources[resourceIndex].pDownloadRes->Map(0, nullptr, (void**)&pData);
-                memcpy(cpuOutput, pData, sizeof(cpuInput));
+                if (useFp16Model)
+                    memcpy(cpuOutputHalf, pData, sizeof(cpuOutputHalf));
+                else
+                    memcpy(cpuOutputFloat, pData, sizeof(cpuOutputFloat));
                 resources[resourceIndex].pDownloadRes->Unmap(0, nullptr);
             }
             else
@@ -268,14 +284,20 @@ int main()
         pDownloadQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[0].pDownloadCommandList);
         FlushAndWait(pDevice, pDownloadQueue);
 
-        float* pData;
+        void* pData;
         resources[0].pDownloadRes->Map(0, nullptr, (void**)&pData);
-        memcpy(cpuOutput, pData, sizeof(cpuInput));
+        if (useFp16Model)
+            memcpy(cpuOutputHalf, pData, sizeof(cpuOutputHalf));
+        else
+            memcpy(cpuOutputFloat, pData, sizeof(cpuOutputFloat));
         resources[0].pDownloadRes->Unmap(0, nullptr);
     }
 
     // save the output to disk
-    saveOutputImage(cpuOutput, "output.png");
+    if (useFp16Model)
+        saveOutputImage(cpuOutputHalf, "output.png", true);
+    else
+        saveOutputImage(cpuOutputFloat, "output.png", false);
 
     for (int i = 0; i < numCopiesToCreate; i++)
     {
