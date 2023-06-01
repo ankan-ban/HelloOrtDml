@@ -6,10 +6,12 @@
 //   - Pipeline multiple inference requests to keep GPU occupied all the time (i.e, don't wait immediately for inference result).
 // 
 
+constexpr bool useFp16Model = true;
+
 const bool useCpuBindings = false;          // bind resources on CPU memory
 const bool perIterationTransfers = true;    // Set to true to perform CPU<->GPU transfers in each iteration (pipelined with inference work)
 constexpr int iterationInFlight = 3;        // no of "iterations in flight" for the pipeline. 1 means no parallelism.
-constexpr bool useFp16Model = true;
+constexpr bool useGpuTimestamps = true;
 
 // for benchmarking
 const int warmupIterations = 1000;
@@ -21,6 +23,7 @@ const int iterations = 1000;
 #include "dml_provider_factory.h"
 #include "onnxruntime_cxx_api.h"
 #include <chrono>
+#include <algorithm>
 
 struct GpuResourceData
 {
@@ -33,6 +36,10 @@ struct GpuResourceData
     // command lists to upload/download the inputs/outputs
     ID3D12GraphicsCommandList* pUploadCommandList;
     ID3D12GraphicsCommandList* pDownloadCommandList;
+
+    // command lists to record GPU timestamps
+    ID3D12GraphicsCommandList* pStartTimestampCL;
+    ID3D12GraphicsCommandList* pEndTimestampCL;
 
     void* dml_resource_input;
     void* dml_resource_output;
@@ -52,7 +59,10 @@ int main()
     ID3D12CommandQueue* pCommandQueue;
     ID3D12CommandQueue* pUploadQueue;
     ID3D12CommandQueue* pDownloadQueue;
-    ID3D12CommandAllocator* pAllocator;
+    ID3D12CommandAllocator* pAllocatorCopy;
+    ID3D12CommandAllocator* pAllocatorDirect;
+    ID3D12QueryHeap* pQueryHeap;
+    ID3D12Resource* pTimeStampBuffer;
 
     GpuResourceData resources[iterationInFlight];
 
@@ -71,22 +81,30 @@ int main()
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pCommandQueue));
 
-    // command allocator to record upload / download commands
-    hr = pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&pAllocator));
+    // command allocator to record upload / download commands and timestamps
+    hr = pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&pAllocatorCopy));
+    hr = pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&pAllocatorDirect));
+
+    // query heap to record GPU timestamps
+    D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
+    queryHeapDesc.Count = iterationInFlight * 2;
+    queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    hr = pDevice->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&pQueryHeap));
+
+    // readback buffer to retrieve results of timestamp queries
+    CreateReadBackBuffer(pDevice, iterationInFlight * 2 * sizeof(uint64_t), &pTimeStampBuffer);
+
+    uint64_t TSFreq = 0;
+    hr = pCommandQueue->GetTimestampFrequency(&TSFreq);
+    double TimeStampFreq = (double)TSFreq;
 
     // create the additional command queues to manage async uploads and downloads
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
     hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pUploadQueue));
     hr = pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pDownloadQueue));
 
-    int numCopiesToCreate = 1;
-    if (perIterationTransfers)
-    {
-        numCopiesToCreate = iterationInFlight;
-    }
-
     // Create d3d12 resources (to be used for input and output of the network)
-    for (int i = 0; i < numCopiesToCreate; i++)
+    for (int i = 0; i < iterationInFlight; i++)
     {
         // default resources
         CreateD3D12Buffer(pDevice, 3 * 720 * 720 * sizeof(float), &resources[i].pInput, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -99,14 +117,23 @@ int main()
         // command lists to handle uploads/downloads
 
         // record the commands in the upload command list
-        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocator, NULL, __uuidof(ID3D12GraphicsCommandList), (void**)&resources[i].pUploadCommandList);
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocatorCopy, NULL, IID_PPV_ARGS(&resources[i].pUploadCommandList));
         resources[i].pUploadCommandList->CopyResource(resources[i].pInput, resources[i].pUploadRes);
         resources[i].pUploadCommandList->Close();
 
         // record the commands in the download command list
-        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocator, NULL, __uuidof(ID3D12GraphicsCommandList), (void**)&resources[i].pDownloadCommandList);
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_COPY, pAllocatorCopy, NULL, IID_PPV_ARGS(&resources[i].pDownloadCommandList));
         resources[i].pDownloadCommandList->CopyResource(resources[i].pDownloadRes, resources[i].pOutput);
         resources[i].pDownloadCommandList->Close();
+
+        // command lists for recording timestamp queries
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_DIRECT, pAllocatorDirect, NULL, IID_PPV_ARGS(&resources[i].pStartTimestampCL));
+        resources[i].pStartTimestampCL->EndQuery(pQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, i * 2 + 0);    // start time stamp
+        resources[i].pStartTimestampCL->Close();
+        hr = pDevice->CreateCommandList(1, D3D12_COMMAND_LIST_TYPE_DIRECT, pAllocatorDirect, NULL, IID_PPV_ARGS(&resources[i].pEndTimestampCL));
+        resources[i].pEndTimestampCL->EndQuery(pQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, i * 2 + 1);    // end time stamp
+        resources[i].pEndTimestampCL->ResolveQueryData(pQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, i * 2, 2, pTimeStampBuffer, i * 2 * sizeof(uint64_t));
+        resources[i].pEndTimestampCL->Close();
     }
 
     // Event and D3D12 Fence to manage CPU<->GPU sync (we want to keep 2 iterations in "flight")
@@ -156,7 +183,7 @@ int main()
     int64_t outputDim[] = { 1, 3, 720, 720 };
 
     // Create ORT tensors from D3D12 resources that we created
-    for (int i = 0; i < numCopiesToCreate; i++)
+    for (int i = 0; i < iterationInFlight; i++)
     {
         ortDmlApi->CreateGPUAllocationFromD3DResource(resources[i].pInput, &resources[i].dml_resource_input);
         ortDmlApi->CreateGPUAllocationFromD3DResource(resources[i].pOutput, &resources[i].dml_resource_output);
@@ -169,24 +196,6 @@ int main()
 
     if (useCpuBindings)
     {
-        /*
-        OrtMemoryInfo* cpu_memory_info;
-        ortApi.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_memory_info);
-        if (useFp16Model)
-        {
-            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuInputFloat, sizeof(cpuInputFloat), inputDim,
-                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &cpu_ort_tensor_input);
-            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuOutputFloat, sizeof(cpuOutputFloat), inputDim,
-                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &cpu_ort_tensor_output);
-        }
-        else
-        {
-            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuInputHalf, sizeof(cpuInputHalf), inputDim,
-                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, &cpu_ort_tensor_input);
-            ortApi.CreateTensorWithDataAsOrtValue(cpu_memory_info, cpuOutputHalf, sizeof(cpuOutputHalf), inputDim,
-                4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, &cpu_ort_tensor_output);
-        }
-        */
         OrtMemoryInfo* cpu_memory_info;
         ortApi.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &cpu_memory_info);
 
@@ -230,10 +239,12 @@ int main()
         ioBinding.BindOutput(OuptutTensorName.get(), outputTensor);
         ioBinding.SynchronizeInputs();
     }
-    // Benchmark the model (schedule 100 iterations on the command queue for testing)
+
     Ort::RunOptions runOptions;
 
     // benchmarking run with few warm-up iterations
+    std::vector<double> gpuTimes = {};
+
     auto start = std::chrono::high_resolution_clock::now();
     int totalIterations = warmupIterations + iterations;
     for (int i = 0; i < totalIterations; i++)
@@ -249,7 +260,7 @@ int main()
         }
         else
         {
-            int resourceIndex = fenceVal % numCopiesToCreate;
+            int resourceIndex = fenceVal % iterationInFlight;
 
             if (perIterationTransfers)
             {
@@ -279,7 +290,14 @@ int main()
                 pCommandQueue->Wait(pFenceUpload, fenceVal);
             }
 
+            if (useGpuTimestamps)
+                pCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pStartTimestampCL);
+
             session.Run(runOptions, ioBinding);
+
+            if (useGpuTimestamps)
+                pCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&resources[resourceIndex].pEndTimestampCL);
+
             pCommandQueue->Signal(pFenceInference, fenceVal);
 
             if (perIterationTransfers)
@@ -300,12 +318,12 @@ int main()
 
             if (oldIter > 0)
             {
+                resourceIndex = oldIter % iterationInFlight;
+
                 if (perIterationTransfers)
                 {
                     pFenceDownload->SetEventOnCompletion(oldIter, hEvent);
                     DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
-
-                    resourceIndex = oldIter % numCopiesToCreate;
 
                     // read back data
                     void* pData;
@@ -320,6 +338,17 @@ int main()
                 {
                     pFenceInference->SetEventOnCompletion(oldIter, hEvent);
                     DWORD retVal = WaitForSingleObject(hEvent, INFINITE);
+                }
+
+                // read back the GPU timestamps to compute GPU side execution time
+                if (useGpuTimestamps && (i >= warmupIterations))
+                {
+                    uint64_t* pTS;
+                    pTimeStampBuffer->Map(0, nullptr, (void **)&pTS);
+                    double time = (pTS[resourceIndex * 2 + 1] - pTS[resourceIndex * 2 + 0]) / TimeStampFreq;
+                    pTimeStampBuffer->Unmap(0, nullptr);
+
+                    gpuTimes.push_back(time * 1000.0);  // time in ms
                 }
             }
         }
@@ -356,7 +385,7 @@ int main()
     else
         saveOutputImage(cpuOutputFloat, "output.png", false);
 
-    for (int i = 0; i < numCopiesToCreate; i++)
+    for (int i = 0; i < iterationInFlight; i++)
     {
         ortDmlApi->FreeGPUAllocation(resources[i].dml_resource_input);
         ortDmlApi->FreeGPUAllocation(resources[i].dml_resource_output);
@@ -368,6 +397,9 @@ int main()
         resources[i].pUploadCommandList->Release();
         resources[i].pUploadRes->Release();
         resources[i].pDownloadRes->Release();
+
+        resources[i].pStartTimestampCL->Release();
+        resources[i].pEndTimestampCL->Release();
     }
 
     if (cpu_ort_tensor_input)
@@ -382,10 +414,21 @@ int main()
     pCommandQueue->Release();
     pUploadQueue->Release();
     pDownloadQueue->Release();
-    pAllocator->Release();
+    pAllocatorCopy->Release();
+    pAllocatorDirect->Release();
+    pQueryHeap->Release();
+    pTimeStampBuffer->Release();
     pDevice->Release();
     session.release();
     CloseHandle(hEvent);
     printf("\nInference loop done. %d iterations in %g ms - avg: %g ms per iteration\n", iterations, duration, duration/iterations);
+
+    if (useGpuTimestamps)
+    {
+        // print more details from GPU times
+        std::sort(gpuTimes.begin(), gpuTimes.end());
+        printf("\nMedian GPU time: %g ms\n", gpuTimes[gpuTimes.size() / 2]);
+    }
+
     return 0;
 }
